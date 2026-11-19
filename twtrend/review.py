@@ -30,7 +30,7 @@ def _ci(r: np.ndarray, n_boot: int = 2000, seed: int = 0) -> tuple[float, float]
 
 def exit_category(reason: str) -> str:
     s = str(reason)
-    for key, cat in (("手動", "手動"), ("L3", "L3 排除"), ("極端", "極端停損"), ("初始停損", "初始停損"),
+    for key, cat in (("手動", "手動"), ("健檢", "健檢結束"), ("L3", "L3 排除"), ("極端", "極端停損"), ("初始停損", "初始停損"),
                      ("追蹤停利", "追蹤停利"), ("L1", "L1 減碼"), ("安全分", "安全分待出場"),
                      ("MA60", "MA60 破線"), ("輪動", "排名輪動"), ("未平倉", "未平倉")):
         if key in s:
@@ -127,6 +127,103 @@ def candidate_followup(sig: pd.DataFrame, md: MarketData, horizons=(20, 60)) -> 
     return pd.DataFrame(rows).sort_values("筆數", ascending=False)
 
 
+# ---------------------------------------------------------------- 持股健檢
+def _flag_events(health: pd.DataFrame, item: str) -> pd.DataFrame:
+    """某項目「減弱」的事件：同一檔持股連續被標記只算第一次（避免重複計算同一段走勢）。"""
+    h = health.sort_values(["stock_id", "date"])
+    flagged = h["weak_items"].fillna("").str.split("、").map(lambda xs: item in xs)
+    prev = flagged.groupby(h["stock_id"]).shift(1, fill_value=False)
+    return h[flagged & ~prev]
+
+
+def weak_followup(health: pd.DataFrame, md: MarketData, horizons=(20, 60)) -> pd.DataFrame:
+    """每個「減弱」項目出現後的實際走勢，對照同日「健康」持股；用數據決定哪些項目值得升級為出場條件。"""
+    if health is None or health.empty:
+        return pd.DataFrame()
+    from .health import ITEMS
+    h = health.copy()
+    h["date"] = pd.to_datetime(h["date"])
+    hz = horizons[-1]
+    healthy = h[h["status"] == "健康"]
+    base = np.array([forward_return(md, s, d, hz) for s, d in zip(healthy["stock_id"], healthy["date"])], float)
+    base = base[~np.isnan(base)]
+    rows = []
+    for item in ITEMS:
+        ev = _flag_events(h, item)
+        if ev.empty:
+            continue
+        fr = {k: np.array([forward_return(md, s, d, k) for s, d in zip(ev["stock_id"], ev["date"])], float)
+              for k in horizons}
+        r = fr[hz][~np.isnan(fr[hz])]
+        row = {"減弱項目": item, "事件數": len(ev), "可追蹤": len(r),
+               **{f"後{k}日平均": float(np.nanmean(fr[k])) if np.isfinite(fr[k]).any() else np.nan for k in horizons},
+               f"後{hz}日下跌比例": float((r < 0).mean()) if len(r) else np.nan,
+               f"健康持股後{hz}日": float(base.mean()) if len(base) else np.nan}
+        if len(r) >= 3 and len(base) >= 3:
+            diff = compare_expectancy(pd.Series(base), pd.Series(r))
+            row.update({"差": diff["差"], "CI下": diff["CI下"], "CI上": diff["CI上"]})
+            if len(r) < MIN_GROUP:
+                row["結論"] = "樣本不足"
+            elif diff["CI上"] < 0:
+                row["結論"] = "顯著較差：可考慮升級為出場"
+            else:
+                row["結論"] = "與健康持股無顯著差異：維持減弱不出場"
+        else:
+            row["結論"] = "樣本不足"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def weak_trade_outcome(trades: pd.DataFrame) -> pd.DataFrame:
+    """持有期間曾出現某項「減弱」的交易，最終 R 與未出現者比較。"""
+    if trades.empty or "weak_seen" not in trades:
+        return pd.DataFrame()
+    from .health import ITEMS
+    t = trades.dropna(subset=["r_multiple"])
+    seen = t["weak_seen"].fillna("").str.split("、")
+    rows = []
+    for item in ITEMS:
+        has = seen.map(lambda xs: item in xs)
+        if has.sum() == 0:
+            continue
+        cmp_ = compare_expectancy(t.loc[~has, "r_multiple"], t.loc[has, "r_multiple"])
+        rows.append({"減弱項目": item, "曾減弱筆數": int(has.sum()), "曾減弱平均R": cmp_["B期望值"],
+                     "未減弱筆數": int((~has).sum()), "未減弱平均R": cmp_["A期望值"], "差": cmp_["差"],
+                     "CI下": cmp_["CI下"], "CI上": cmp_["CI上"], "結論": cmp_["結論"].replace("B ", "曾減弱者")})
+    return pd.DataFrame(rows)
+
+
+def health_exit_outcome(trades: pd.DataFrame, md: MarketData) -> pd.DataFrame:
+    """各健檢「結束」項目出場的 R 與出場後走勢（出場後又大漲比例高 = 條件太嚴）。"""
+    if trades.empty or "exit_health_items" not in trades:
+        return pd.DataFrame()
+    t = trades[trades["exit_health_items"].fillna("") != ""].copy()
+    if t.empty:
+        return pd.DataFrame()
+    t["item"] = t["exit_health_items"].str.split("、")
+    t = t.explode("item")
+    t["後60日"] = [forward_return(md, s, d, 60) for s, d in zip(t["stock_id"], t["exit_date"])]
+    t["60日最高"] = [forward_max(md, s, d, 60) for s, d in zip(t["stock_id"], t["exit_date"])]
+    return t.groupby("item").agg(筆數=("r_multiple", "size"), 平均R=("r_multiple", "mean"),
+                                 出場後60日平均=("後60日", "mean"),
+                                 再漲超過20比例=("60日最高", lambda x: float((x > 0.2).mean()))).reset_index() \
+        .rename(columns={"item": "結束項目", "再漲超過20比例": "60日內再漲>20%比例"})
+
+
+def deviation_summary(journal: pd.DataFrame) -> pd.DataFrame:
+    """實盤偏離訊號的結果（每月檢討）。"""
+    if journal.empty or "followed_signal" not in journal:
+        return pd.DataFrame()
+    j = journal.dropna(subset=["r_multiple"]).copy()
+    j["月份"] = pd.to_datetime(j["exit_date"]).dt.strftime("%Y-%m")
+    j["依訊號"] = np.where(j["followed_signal"].astype(float) >= 1, "依訊號", "偏離")
+    out = j.groupby(["月份", "依訊號"]).agg(筆數=("r_multiple", "size"), 平均R=("r_multiple", "mean"),
+                                         總R=("r_multiple", "sum")).reset_index()
+    reasons = j[j["依訊號"] == "偏離"].groupby("月份")["deviation_reason"].apply(
+        lambda x: "；".join(str(v) for v in x if v))
+    return out.merge(reasons.rename("偏離理由"), on="月份", how="left")
+
+
 # ---------------------------------------------------------------- A/B 比較
 def compare_expectancy(a: pd.Series, b: pd.Series, n_boot: int = 4000, seed: int = 0) -> dict:
     """兩組 R 值期望值差（B − A）的 bootstrap 95% CI。"""
@@ -192,7 +289,8 @@ def _sig_lower(df: pd.DataFrame, key: str, low: str, high: str) -> tuple[bool, s
     return bool(ok), txt
 
 
-def findings(trades: pd.DataFrame, md: MarketData, sig: pd.DataFrame | None = None) -> list[Finding]:
+def findings(trades: pd.DataFrame, md: MarketData, sig: pd.DataFrame | None = None,
+             health: pd.DataFrame | None = None) -> list[Finding]:
     out: list[Finding] = []
     t = trades.dropna(subset=["r_multiple"])
     n = len(t)
@@ -264,7 +362,29 @@ def findings(trades: pd.DataFrame, md: MarketData, sig: pd.DataFrame | None = No
         out.append(Finding("候選修正" if ok else "觀察", "1 月季節性", txt,
                            "考慮 1 月降低新部位或提高 52 週高門檻（需回測兩段驗證）" if ok else "維持"))
 
-    # 8. 候選機會成本
+    # 8. 持股健檢：「減弱」後的實際結果
+    if health is not None and not health.empty:
+        wf = weak_followup(health, md)
+        for _, r in wf.iterrows():
+            if r["結論"].startswith("顯著較差"):
+                out.append(Finding("候選修正", f"健檢「{r['減弱項目']}」減弱",
+                                   f"{r['可追蹤']} 次事件後 60 日平均 {r['後60日平均']:+.1%}，健康持股 {r['健康持股後60日']:+.1%}"
+                                   f"（差 CI {r['CI下']:+.1%}~{r['CI上']:+.1%}）",
+                                   "可考慮把此項「減弱」升級為出場條件；先以 A/B 模擬帳戶驗證"))
+            elif r["可追蹤"] >= MIN_GROUP:
+                out.append(Finding("正常", f"健檢「{r['減弱項目']}」減弱",
+                                   f"{r['可追蹤']} 次事件後 60 日平均 {r['後60日平均']:+.1%}，健康持股 {r['健康持股後60日']:+.1%}",
+                                   "維持「減弱不出場」"))
+        ho = health_exit_outcome(trades, md)
+        for _, r in ho.iterrows():
+            if r["筆數"] >= MIN_GROUP and r["60日內再漲>20%比例"] > 0.35:
+                knob = {"長期趨勢": "health.long_trend_exit", "相對強度": "health.rank_exit",
+                        "營收動能": "health.revenue_exit", "停滯檢查": "health.time_stop"}.get(r["結束項目"], "")
+                out.append(Finding("候選修正", f"健檢「{r['結束項目']}」出場可能太早",
+                                   f"{r['筆數']} 筆中 {r['60日內再漲>20%比例']:.0%} 出場後 60 日內再漲 > 20%",
+                                   f"建立 A/B 帳戶：--set {knob}=false" if knob else "以 A/B 帳戶驗證"))
+
+    # 9. 候選機會成本
     if sig is not None and not sig.empty:
         cf = candidate_followup(sig, md)
         bought = cf[cf["類別"] == "已買"]

@@ -85,6 +85,8 @@ def cmd_weekly(args):
     print(f"[{out['date'].date()}] 趨勢分排名（L3 通過者）前 15：")
     cols = ["trend_score", "rank", "high_52w_ratio", "tsmom_12m", "rel_strength", "revenue_yoy"]
     print(tr[tr["trend_score"].notna()][cols].head(15).round(3).to_string())
+    if out.get("health"):
+        _print_health(out["health"])
     if out["buys"]:
         print("下週一買入清單（限價、未成交不追價）：")
         for o in out["buys"]:
@@ -95,6 +97,41 @@ def cmd_weekly(args):
     else:
         print("買入清單：無（L1 不允許新增、或無合格候選 / 可用資金）")
     notify.flush_alerts(db, dry_run=args.dry_run)
+
+
+def _print_health(health: dict) -> None:
+    from . import live
+    df = live.health_table(health)
+    if df.empty:
+        return
+    n = df["狀態"].value_counts()
+    print(f"持股趨勢健檢：健康 {n.get('健康', 0)}、減弱 {n.get('減弱', 0)}、結束 {n.get('結束', 0)}"
+          "（只有「結束」才出場；「減弱」續抱、不加碼、減碼時優先賣）")
+    for _, r in df.iterrows():
+        print(f"  {r['代碼']}  {r['狀態']}  {r['觸發']}")
+        for k in [c for c in df.columns if c not in ("代碼", "狀態", "觸發")]:
+            v = r.get(k)
+            if isinstance(v, str) and not v.startswith("健康"):
+                print(f"      {k}：{v}")
+
+
+def cmd_health(args):
+    from . import live
+    from .data.loader import load_market_data
+    from .engine import SignalEngine
+    cfg, db = _ctx(args)
+    md = load_market_data(db)
+    date = pd.Timestamp(args.date) if args.date else md.dates[-1]
+    eng = SignalEngine(md.slice(date), cfg)
+    positions = live.load_positions(db)
+    if not positions:
+        print("目前沒有持股")
+        return
+    health = eng.health_check(date, positions, weekly=True)
+    live.save_health(db, health)
+    live.save_positions(db, positions)
+    print(f"[{date.date()}]")
+    _print_health(health)
 
 
 def cmd_orders(args):
@@ -145,6 +182,11 @@ def cmd_monitor(args):
     print(lights_frame(lights)[["level", "metric", "value", "yellow", "red", "note"]].round(3).to_string(index=False))
     print(f"\n整體：{overall(lights)}")
     n = int(jr["r_multiple"].notna().sum()) if not jr.empty else 0
+    from .review import deviation_summary
+    dev = deviation_summary(jr)
+    if not dev.empty:
+        print("\n偏離訊號檢討（每月）：")
+        print(dev.round(2).to_string(index=False))
     stage, msg = next_stage(args.stage, lights, n)
     print(f"資金階段建議：{STAGES[stage]['name']}（每筆風險 {STAGES[stage]['risk']:.2%}）— {msg}")
 
@@ -161,13 +203,14 @@ def cmd_dashboard(args):
     saf = eng.safety(date, full=True)
     tr = eng.trend(date)
     positions = live.load_positions(db)
+    health = eng.health_check(date, positions, weekly=True, saf=saf)
     jr = live.journal(db)
     eq = live.equity_curve_from_journal(db, cfg)
     orders = db.query("SELECT exec_date AS 執行日, stock_id AS 代碼, side AS 買賣, shares AS 股數, "
                       "limit_price AS 限價 FROM orders WHERE status='pending' ORDER BY id")
     closed = jr[jr["r_multiple"].notna()].rename(columns={"exit_date": "exit_date"}) if not jr.empty else None
     page = dashboard.render(
-        eng.regime, dashboard.candidates_frame(tr, saf), dashboard.holdings_frame(positions, md, saf, date),
+        eng.regime, dashboard.candidates_frame(tr, saf), dashboard.holdings_frame(positions, md, saf, date, health),
         orders, closed, eq if len(eq) > 1 else None, evaluate_lights(jr, eq, cfg.monitor),
         {"p95": cfg.monitor.mdd_yellow, "p99": cfg.monitor.mdd_red}, title="台股趨勢追蹤 · 實盤監控")
     out = Path(args.out)
@@ -323,6 +366,12 @@ def cmd_paper_status(args):
         h = st["holdings"][["stock_id", "shares", "entry_date", "entry_price", "close", "stop", "r_multiple", "manual_entry"]]
         print("持股：")
         print(h.round({"entry_price": 2, "close": 2, "stop": 2, "r_multiple": 2}).to_string(index=False))
+    ph = paper.health(db, args.name)
+    if not ph.empty and not st["holdings"].empty:
+        last = ph[ph["stock_id"].isin(st["holdings"]["stock_id"])].sort_values("date").groupby("stock_id").last()
+        print(f"最近一次持股健檢：")
+        for sid, r in last.iterrows():
+            print(f"  {sid}  {r['date'].date()}  {r['status']}  {r['triggers'] or ''}")
     if not st["pending"].empty:
         print("待撮合委託：")
         print(st["pending"].to_string(index=False))
@@ -342,8 +391,22 @@ def cmd_paper_review(args):
     md = _paper_md(db)
     t = paper.trades(db, args.name, args.phase)
     sig = paper.signals(db, args.name)
+    hl = paper.health(db, args.name)
+    if args.phase and not hl.empty:
+        hl = hl[hl["phase"] == args.phase]
     print(f"== 規則檢討：{args.name}（{args.phase or '全部'}，{len(t)} 筆已結算）==")
-    print(review.findings_frame(review.findings(t, md, sig)).to_string(index=False))
+    print(review.findings_frame(review.findings(t, md, sig, hl)).to_string(index=False))
+    if not hl.empty:
+        print("\n-- 持股健檢：減弱後的實際走勢（對照同期健康持股）--")
+        print(review.weak_followup(hl, md).round(3).to_string(index=False))
+        wo = review.weak_trade_outcome(t)
+        if not wo.empty:
+            print("\n-- 持股健檢：曾減弱 vs 未減弱的交易最終 R --")
+            print(wo.round(3).to_string(index=False))
+        he = review.health_exit_outcome(t, md)
+        if not he.empty:
+            print("\n-- 持股健檢：各「結束」項目出場結果 --")
+            print(he.round(3).to_string(index=False))
     if not t.empty:
         for by in ("出場原因", "安全分組", "趨勢分組", "進場狀態"):
             df = review.attribution(t, by)
@@ -382,11 +445,19 @@ def cmd_paper_report(args):
     if focus:
         t = paper.trades(db, focus, args.phase)
         sig = paper.signals(db, focus)
-        fs = review.findings_frame(review.findings(t, md, sig))
+        hl = paper.health(db, focus)
+        if args.phase and not hl.empty:
+            hl = hl[hl["phase"] == args.phase]
+        fs = review.findings_frame(review.findings(t, md, sig, hl))
         fs.insert(1, "帳戶", focus)
         if not t.empty:
             attr = {f"{focus} · {by}": review.attribution(t, by) for by in ("出場原因", "安全分組", "趨勢分組", "進場狀態", "手動")}
             efu = review.exit_followup(t, md)
+            for title, df in ((f"{focus} · 健檢：減弱後走勢 vs 健康持股", review.weak_followup(hl, md)),
+                              (f"{focus} · 健檢：曾減弱 vs 未減弱的交易 R", review.weak_trade_outcome(t)),
+                              (f"{focus} · 健檢：各結束項目出場結果", review.health_exit_outcome(t, md))):
+                if df is not None and not df.empty:
+                    attr[title] = df
         cfu = review.candidate_followup(sig, md) if not sig.empty else None
         others = [n for n in accounts if n != focus]
         if others:
@@ -503,6 +574,10 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--date")
         s.add_argument("--dry-run", action="store_true", help="只印出提醒，不推播")
         s.set_defaults(func=fn)
+
+    s = sub.add_parser("health", help="持股趨勢健檢：每檔持股 健康 / 減弱 / 結束 與觸發項目")
+    s.add_argument("--date")
+    s.set_defaults(func=cmd_health)
 
     s = sub.add_parser("orders", help="列出委託")
     s.add_argument("--status", default="pending")

@@ -188,7 +188,7 @@ def render(regime: pd.DataFrame, candidates: pd.DataFrame | None = None, holding
                       f'<p class="muted">底色：綠 多頭、黃 轉弱警戒、紅 空頭、藍 打底轉強</p>{score_chart}</section>']
 
     if holdings is not None:
-        sections.append(f"<section><h2>持股：安全分與停損距離</h2>{table(holdings, {'停損距離': 'pct', '損益': 'pct', '股數': 'int', '安全分': 'int'})}</section>")
+        sections.append(f"<section><h2>持股：健檢、安全分與停損距離</h2>{table(holdings, {'停損距離': 'pct', '損益': 'pct', '股數': 'int', '安全分': 'int'})}</section>")
     if orders is not None:
         sections.append(f"<section><h2>待執行委託</h2>{table(orders, {'股數': 'int'})}</section>")
     if candidates is not None:
@@ -277,7 +277,7 @@ footer{margin-top:20px}
 """
 
 
-def holdings_frame(positions, md, safety: pd.DataFrame, as_of) -> pd.DataFrame:
+def holdings_frame(positions, md, safety: pd.DataFrame, as_of, health: dict | None = None) -> pd.DataFrame:
     rows = []
     d = pd.Timestamp(as_of)
     for s, p in positions.items():
@@ -287,6 +287,7 @@ def holdings_frame(positions, md, safety: pd.DataFrame, as_of) -> pd.DataFrame:
             "代碼": s, "股數": p.shares, "成本": p.entry_price, "收盤": c, "損益": c / p.entry_price - 1,
             "停損價": p.stop, "停損距離": (c - p.stop) / c, "極端停損": p.catastrophic_stop,
             "安全分": float(safety.at[s, "score"]) if s in safety.index else np.nan,
+            "健檢": health[s].summary() if health and s in health else "",
             "狀態": "待出場" if p.pending_exit_since is not None else "",
         })
     return pd.DataFrame(rows)

@@ -40,6 +40,8 @@ def load_positions(db: Database) -> dict[str, Position]:
             entry_state=j["entry_l1_state"] if j is not None else "",
             entry_trend_score=float(j["entry_trend_score"]) if j is not None and pd.notna(j["entry_trend_score"]) else np.nan,
             entry_safety_score=float(j["entry_safety_score"]) if j is not None and pd.notna(j["entry_safety_score"]) else np.nan,
+            health_weekly=json.loads(r.health_json) if getattr(r, "health_json", None) else {},
+            weak_seen=[x for x in (getattr(r, "weak_seen", "") or "").split("、") if x],
         )
     return out
 
@@ -50,9 +52,11 @@ def save_positions(db: Database, positions: dict[str, Position]) -> None:
         for p in positions.values():
             c.execute(
                 "INSERT INTO positions (stock_id, shares, entry_date, entry_price, initial_stop, trailing_stop,"
-                " highest_close, one_r, pending_exit_since, catastrophic_stop) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " highest_close, one_r, pending_exit_since, catastrophic_stop, health_json, weak_seen)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (p.stock_id, p.shares, _d(p.entry_date), p.entry_price, p.initial_stop, p.trailing_stop,
-                 p.highest_close, p.one_r, _d(p.pending_exit_since), p.catastrophic_stop))
+                 p.highest_close, p.one_r, _d(p.pending_exit_since), p.catastrophic_stop,
+                 json.dumps(p.health_weekly or {}, ensure_ascii=False), "、".join(p.weak_seen or [])))
 
 
 def _d(x) -> str | None:
@@ -136,7 +140,10 @@ def run_daily(db: Database, cfg: Config, date=None, md: MarketData | None = None
     for s, p in positions.items():
         if s in saf.index and saf.at[s, "score"] < cfg.l3.half_size_min and p.pending_exit_since is None:
             _alert(db, date, "safety", f"{s} 安全分降至 {saf.at[s, 'score']:.0f}，進入待出場")
-    sells = eng.sell_signals(date, positions, equity, weekly=date.weekday() == cfg.l4.rebalance_weekday)
+    weekly = date.weekday() == cfg.l4.rebalance_weekday
+    sells = eng.sell_signals(date, positions, equity, weekly=weekly)
+    if weekly:
+        save_health(db, eng.last_health)
     next_day = _next_trading_day(date)
     # 過期未成交的買單作廢（不追價）；已有待執行賣單的股票不重複下單
     db.execute("UPDATE orders SET status='expired' WHERE status='pending' AND side='buy' AND exec_date <= ?",
@@ -173,6 +180,13 @@ def run_weekly(db: Database, cfg: Config, date=None, md: MarketData | None = Non
         "stock_id": saf.index, "announce_date": date.strftime("%Y-%m-%d"),
         "components": saf["penalties"].values, "score": saf["score"].values,
     }))
+    health = eng.health_check(date, positions, weekly=True, saf=saf)
+    save_health(db, health)
+    save_positions(db, positions)
+    for sid, hr in health.items():
+        if hr.status != "健康":
+            _log(db, date, "HEALTH", sid, hr.status, hr.summary(),
+                 {k: list(v) for k, v in hr.items.items()})
     pending_sells = set(db.query("SELECT stock_id FROM orders WHERE side='sell' AND status='pending'")["stock_id"])
     buys = eng.buy_signals(date, positions, equity, cash, pending_sells)
     next_day = _next_trading_day(date)
@@ -181,7 +195,27 @@ def run_weekly(db: Database, cfg: Config, date=None, md: MarketData | None = Non
         _log(db, date, "L4", o.stock_id, "buy_signal", o.reason, o.meta)
         _alert(db, date, "buy", f"買入 {o.stock_id} {o.shares} 股，限價 {o.limit_price}，"
                                 f"停損 {o.meta['stop']:.2f}（{o.reason}）")
-    return {"date": date, "buys": buys, "trend": tr, "safety": saf, "equity": equity}
+    return {"date": date, "buys": buys, "trend": tr, "safety": saf, "equity": equity, "health": health}
+
+
+def save_health(db: Database, health: dict) -> None:
+    """每週健檢結果寫入 health_checks（交易日誌的健檢紀錄）。"""
+    if not health:
+        return
+    from .paper import health_rows
+    db.upsert_df("health_checks", health_rows([hr.to_row() for hr in health.values()]))
+
+
+def health_table(health: dict) -> pd.DataFrame:
+    rows = []
+    for sid, hr in health.items():
+        r = {"代碼": sid, "狀態": hr.status, "觸發": "、".join(hr.triggers()) or "—"}
+        for k, (st, note) in hr.items.items():
+            r[k] = f"{st}｜{note}"
+        rows.append(r)
+    order = {"結束": 0, "減弱": 1, "健康": 2}
+    df = pd.DataFrame(rows)
+    return df.sort_values("狀態", key=lambda s: s.map(order)).reset_index(drop=True) if not df.empty else df
 
 
 def _next_trading_day(d: pd.Timestamp) -> pd.Timestamp:
@@ -239,10 +273,11 @@ def record_fill(db: Database, cfg: Config, order_id: int, fill_date: str, fill_p
         if not jr.empty:
             db.execute(
                 "UPDATE trade_journal SET exit_date=?, exit_price=?, exit_reason=?, r_multiple=?, exit_slippage=?,"
-                " followed_signal=MIN(followed_signal, ?), deviation_reason=COALESCE(?, deviation_reason) WHERE id=?",
+                " followed_signal=MIN(followed_signal, ?), deviation_reason=COALESCE(?, deviation_reason),"
+                " weak_seen=? WHERE id=?",
                 (fill_date, fill_price, meta.get("reason"), r_mult,
                  1 - fill_price / o["signal_price"] if o["signal_price"] else None, int(followed), deviation,
-                 int(jr.iloc[0]["id"])))
+                 "、".join(p.weak_seen or []), int(jr.iloc[0]["id"])))
         save_positions(db, positions)
         result = {"r_multiple": r_mult}
     db.execute("UPDATE orders SET status='filled' WHERE id=?", (order_id,))

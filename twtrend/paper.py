@@ -38,7 +38,12 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     entry_date TEXT, entry_price REAL, shares INTEGER, initial_stop REAL, one_r REAL,
     exit_date TEXT, exit_price REAL, exit_signal_price REAL, exit_reason TEXT, pnl REAL, r_multiple REAL,
     entry_state TEXT, trend_score REAL, safety_score REAL, industry TEXT, holding_days INTEGER,
-    manual_entry INTEGER, manual_exit INTEGER, phase TEXT
+    manual_entry INTEGER, manual_exit INTEGER, phase TEXT, weak_seen TEXT, exit_health_items TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_health (
+    name TEXT, date TEXT, stock_id TEXT, status TEXT, triggers TEXT, weak_items TEXT, end_items TEXT,
+    detail TEXT, phase TEXT,
+    PRIMARY KEY (name, date, stock_id)
 );
 CREATE TABLE IF NOT EXISTS paper_signals (
     name TEXT, date TEXT, stock_id TEXT, rank INTEGER, trend_score REAL, safety_score REAL, size_mult REAL,
@@ -56,6 +61,19 @@ _VOLATILE_KEYS = {"db_path", "finmind_token"}
 
 def ensure_schema(db: Database) -> None:
     db.conn.executescript(PAPER_SCHEMA)
+    db.add_columns("paper_trades", {"weak_seen": "TEXT", "exit_health_items": "TEXT"})
+
+
+def health_rows(rows: list[dict]) -> pd.DataFrame:
+    """把 HealthResult.to_row() 轉成精簡欄位 + detail JSON。"""
+    from .health import ITEMS
+    out = []
+    for r in rows:
+        detail = {k: [r.get(k, ""), r.get(k + "_說明", "")] for k in ITEMS if r.get(k)}
+        out.append({"date": r["date"], "stock_id": r["stock_id"], "status": r["status"], "triggers": r["triggers"],
+                    "weak_items": r["weak_items"], "end_items": r["end_items"],
+                    "detail": json.dumps(detail, ensure_ascii=False)})
+    return pd.DataFrame(out)
 
 
 # ---------------------------------------------------------------- 規則版本
@@ -213,6 +231,11 @@ def run_account(db: Database, md: MarketData, name: str, until=None,
         s["name"] = name
         s["phase"] = [_phase(d, ff) for d in s["date"]]
         db.upsert_df("paper_signals", s)
+    if br.health_log:
+        h = health_rows(br.health_log)
+        h["name"] = name
+        h["phase"] = [_phase(d, ff) for d in h["date"]]
+        db.upsert_df("paper_health", h)
     if br.decisions:
         dd = pd.DataFrame(br.decisions)
         dd["name"] = name
@@ -247,7 +270,7 @@ def set_active(db: Database, name: str, active: bool) -> None:
 
 def delete_account(db: Database, name: str) -> None:
     with db.tx() as c:
-        for t in ("paper_accounts", "paper_equity", "paper_trades", "paper_signals", "paper_decisions"):
+        for t in ("paper_accounts", "paper_equity", "paper_trades", "paper_signals", "paper_decisions", "paper_health"):
             c.execute(f"DELETE FROM {t} WHERE name=?", (name,))
 
 
@@ -286,6 +309,15 @@ def signals(db: Database, name: str | None = None) -> pd.DataFrame:
     if name:
         q += " WHERE name=?"; p = (name,)
     df = db.query(q, p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+def health(db: Database, name: str | None = None) -> pd.DataFrame:
+    q, p = "SELECT * FROM paper_health", ()
+    if name:
+        q += " WHERE name=?"; p = (name,)
+    df = db.query(q + " ORDER BY date, stock_id", p)
     df["date"] = pd.to_datetime(df["date"])
     return df
 

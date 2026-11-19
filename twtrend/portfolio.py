@@ -28,6 +28,9 @@ class Position:
     signal_price: float = float("nan")
     pending_exit_since: pd.Timestamp | None = None
     entry_cost: float = 0.0
+    manual: bool = False                                     # 手動下單（人為干預）
+    health_weekly: dict = field(default_factory=dict)        # 最近一次每週健檢的每週項目 {項目: [狀態, 說明]}
+    weak_seen: list = field(default_factory=list)            # 持有期間曾出現「減弱」的項目
 
     @property
     def stop(self) -> float:

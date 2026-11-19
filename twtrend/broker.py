@@ -57,6 +57,7 @@ class SimBroker:
         self.trades: list[dict] = []
         self.decisions: list[dict] = []
         self.signals: list[dict] = []           # 每週候選與買 / 不買原因
+        self.health_log: list[dict] = []        # 每週持股健檢結果
         self.equity: dict[pd.Timestamp, float] = {}
         self.exposure: dict[pd.Timestamp, float] = {}
         self.auto_signals = auto_signals         # False = 純手動帳戶（只撮合、不產生系統訊號）
@@ -121,7 +122,7 @@ class SimBroker:
                     fill * (1 - cfg.l4.catastrophic_stop), m.get("industry", ""), m.get("size_mult", 1.0),
                     m.get("state", ""), m.get("trend_score", np.nan), m.get("safety_score", np.nan),
                     o.signal_date, o.signal_price, None, fee)
-                self.positions[o.stock_id].manual = bool(m.get("manual"))  # type: ignore[attr-defined]
+                self.positions[o.stock_id].manual = bool(m.get("manual"))
                 filled.append({"stock_id": o.stock_id, "side": "buy", "price": fill, "reason": o.reason})
         self.pending = carry
         return filled
@@ -158,6 +159,9 @@ class SimBroker:
         self.pending.extend(new)
         for o in new:
             self._decide(d, o, "sell", o.reason)
+        if weekly:
+            for hr in eng.last_health.values():
+                self.health_log.append(hr.to_row())
         sell_ids = {o.stock_id for o in self.pending if o.side == "sell"}
         if weekly:
             proceeds = sum(self.positions[s].shares * self._px(d, s) for s in sell_ids if s in self.positions)
@@ -216,7 +220,9 @@ class SimBroker:
             "entry_state": p.entry_state, "trend_score": p.entry_trend_score,
             "safety_score": p.entry_safety_score, "industry": p.industry, "open_at_end": open_trade,
             "holding_days": (pd.Timestamp(d) - pd.Timestamp(p.entry_date)).days,
-            "manual_entry": bool(getattr(p, "manual", False)), "manual_exit": bool(o.meta.get("manual")),
+            "manual_entry": bool(p.manual), "manual_exit": bool(o.meta.get("manual")),
+            "weak_seen": "、".join(p.weak_seen or []),
+            "exit_health_items": "、".join(o.meta.get("health_items", [])),
         })
         return value - fee
 
@@ -237,16 +243,15 @@ class SimBroker:
                         "entry_state": p.entry_state, "trend_score": p.entry_trend_score,
                         "safety_score": p.entry_safety_score, "industry": p.industry, "open_at_end": True,
                         "holding_days": (pd.Timestamp(d) - pd.Timestamp(p.entry_date)).days,
-                        "manual_entry": bool(getattr(p, "manual", False)), "manual_exit": False,
+                        "manual_entry": bool(p.manual), "manual_exit": False,
+                        "weak_seen": "、".join(p.weak_seen or []), "exit_health_items": "",
                         "close": px, "stop": p.stop})
         return out
 
     # ------------------------------------------------------------ 序列化
     def to_state(self) -> dict:
         def pos(p: Position):
-            d = p.to_dict()
-            d["manual"] = bool(getattr(p, "manual", False))
-            return _jsonable(d)
+            return _jsonable(p.to_dict())
 
         def order(o: Order):
             return _jsonable(asdict(o))
@@ -261,14 +266,12 @@ class SimBroker:
         self.last_date = pd.Timestamp(st["last_date"]) if st.get("last_date") else None
         self.positions = {}
         for d in st.get("positions", []):
-            manual = d.pop("manual", False)
             for k in ("entry_date", "signal_date", "pending_exit_since"):
                 d[k] = pd.Timestamp(d[k]) if d.get(k) else None
             for k in ("entry_trend_score", "entry_safety_score", "signal_price"):
                 if d.get(k) is None:
                     d[k] = np.nan
             p = Position(**d)
-            p.manual = manual  # type: ignore[attr-defined]
             self.positions[p.stock_id] = p
         self.pending = []
         for d in st.get("pending", []):

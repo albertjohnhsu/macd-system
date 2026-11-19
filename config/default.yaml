@@ -99,6 +99,15 @@ l4:
   portfolio_vol_target: 0.2
   buy_slippage_allow: 0.01
   lot_size: 1
+health:
+  enabled: true
+  long_trend_exit: true
+  rank_exit: true
+  rank_min_universe: 10
+  revenue_exit: true
+  stagnation_weeks: 8
+  time_stop: true
+  time_stop_weeks: 12
 cost:
   commission: 0.001425
   commission_discount: 1.0

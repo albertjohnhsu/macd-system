@@ -135,6 +135,20 @@ class L4Config:
 
 
 @dataclass
+class HealthConfig:
+    """持股趨勢健檢（實盤手冊第 6 點）。每個「結束」條件都可關閉，方便用模擬盤 A/B 驗證。"""
+
+    enabled: bool = True
+    long_trend_exit: bool = True       # 收盤 < MA100 且 12M 報酬 < 0 → 結束
+    rank_exit: bool = True             # 趨勢分跌出前 50% → 結束（輪換為新候選）
+    rank_min_universe: int = 10        # 合格候選少於此數時不做排名出場（樣本太小）
+    revenue_exit: bool = True          # 營收連 3 月負成長且長期趨勢減弱 → 結束
+    stagnation_weeks: int = 8          # 8 週未達 +1R → 減弱
+    time_stop: bool = True             # 12 週仍未達 +1R → 結束（待驗證）
+    time_stop_weeks: int = 12
+
+
+@dataclass
 class CostConfig:
     commission: float = 0.001425
     commission_discount: float = 1.0
@@ -169,6 +183,7 @@ class Config:
     l2: L2Config = field(default_factory=L2Config)
     l3: L3Config = field(default_factory=L3Config)
     l4: L4Config = field(default_factory=L4Config)
+    health: HealthConfig = field(default_factory=HealthConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
 

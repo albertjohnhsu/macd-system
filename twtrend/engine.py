@@ -6,8 +6,10 @@
   1 L3 硬性排除          → 全數賣出
   2 極端保護停損 15%      → 全數賣出（實盤以條件單盤中執行）
   3 追蹤停利 / 初始停損    → 收盤跌破 max(初始停損, 最高收盤 − 3×ATR22)，隔日開盤賣出
-  4 L1 減碼              → 曝險超過分批目標時，先賣安全分最低、再賣趨勢分最低者
+  4 L1 減碼              → 曝險超過分批目標時，先賣健檢「減弱」者，再依安全分、趨勢分由低到高
+  5 持股趨勢健檢「結束」  → 每週：長期趨勢兩項轉負、趨勢分跌出前 50%、營收連 3 月負成長、12 週未達 +1R
   另：安全分 < 50 進入待出場（最長 20 個交易日）；MA60 破線、排名輪動為可選層。
+  健檢「減弱」不是賣出理由（見 health.py）。
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from .config import Config
 from .data.market import MarketData
 from .l1_regime import STATE_ZH, compute_regime, regime_index
 from .l2_trend import compute_features, evaluate_trend
+from .health import END, WEAK, HealthChecker, HealthResult
 from .l3_safety import SafetyEvaluator
 from .portfolio import Order, Position, chandelier, initial_stop_price, position_shares
 
@@ -39,6 +42,8 @@ class SignalEngine:
         self._safety_cache: dict[pd.Timestamp, pd.DataFrame] = {}
         self._safety_base: tuple | None = None
         self._trend_cache: dict[pd.Timestamp, pd.DataFrame] = {}
+        self.health = HealthChecker(self)
+        self.last_health: dict[str, HealthResult] = {}
 
     # ------------------------------------------------------------ 各層查詢
     def regime_at(self, date) -> pd.Series:
@@ -101,6 +106,7 @@ class SignalEngine:
                 orders[p.stock_id] = Order(p.stock_id, "sell", p.shares, d, self._px(d, p.stock_id),
                                            None, reason, prio, meta)
 
+        health = self.health_check(d, positions, weekly, saf)
         for sid, p in positions.items():
             close = self.md.close.at[d, sid]
             if np.isnan(close):
@@ -130,6 +136,12 @@ class SignalEngine:
                 if len(m) > 5 and close < m.iloc[-1] and m.iloc[-1] < m.iloc[-6]:
                     sell(p, "週收盤跌破 MA60 且 MA60 下彎", 5)
                     continue
+            hr = health.get(sid)
+            if weekly and hr is not None and hr.exit_items():
+                items = hr.exit_items()
+                sell(p, "健檢結束：" + "；".join(f"{k}（{hr.items[k][1]}）" for k in items), 5,
+                     health_items=items)
+                continue
             if weekly and c4.rotate_on_rank:
                 tr = self.trend(d)
                 if sid not in tr.index or not bool(tr.at[sid, "hold_zone"]):
@@ -147,6 +159,7 @@ class SignalEngine:
             if exposure > limit * 1.02 + 1:
                 tr = self.trend(d)
                 order = sorted(remaining, key=lambda s: (
+                    0 if (s in health and health[s].status in (WEAK, END)) else 1,
                     saf.at[s, "score"] if s in saf.index else 0,
                     tr.at[s, "trend_score"] if s in tr.index and not np.isnan(tr.at[s, "trend_score"]) else -1))
                 state = STATE_ZH.get(reg.get("state"), reg.get("state"))
@@ -156,6 +169,24 @@ class SignalEngine:
                     sell(remaining[s], f"L1 減碼（{state}，目標曝險 {target:.0%}）", 3)
                     exposure -= value[s]
         return sorted(orders.values(), key=lambda o: o.priority)
+
+    def health_check(self, date, positions: dict[str, Position], weekly: bool,
+                     saf: pd.DataFrame | None = None) -> dict[str, HealthResult]:
+        """持股趨勢健檢：回傳每檔持股的健康 / 減弱 / 結束與觸發項目。"""
+        if not self.cfg.health.enabled or not positions:
+            self.last_health = {}
+            return {}
+        d = pd.Timestamp(date)
+        saf = saf if saf is not None else self.safety(d, full=weekly)
+        reg = self.regime_at(d)
+        state = reg.get("state") if len(reg) else None
+        trend = self.trend(d) if weekly else None
+        out = {}
+        for sid, p in positions.items():
+            row = saf.loc[sid] if sid in saf.index else None
+            out[sid] = self.health.check(d, p, weekly, row, state, trend)
+        self.last_health = out
+        return out
 
     def vol_scaled_cap(self, date, positions: dict[str, Position], equity: float) -> float:
         """組合層級波動上限：20 日年化波動超過目標時，等比例降低曝險上限（只減不加）。"""

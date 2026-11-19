@@ -121,6 +121,10 @@ CREATE TABLE IF NOT EXISTS decision_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT, layer TEXT, stock_id TEXT, action TEXT, reason TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS health_checks (
+    date TEXT, stock_id TEXT, status TEXT, triggers TEXT, weak_items TEXT, end_items TEXT, detail TEXT,
+    PRIMARY KEY (date, stock_id)
+);
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT, kind TEXT, message TEXT, sent INTEGER DEFAULT 0
@@ -136,6 +140,16 @@ class Database:
         self._conn = sqlite3.connect(self.path)
         self._conn.execute("PRAGMA journal_mode=WAL") if self.path != ":memory:" else None
         self._conn.executescript(SCHEMA)
+        # 舊資料庫升級
+        self.add_columns("positions", {"health_json": "TEXT", "weak_seen": "TEXT"})
+        self.add_columns("trade_journal", {"weak_seen": "TEXT"})
+
+    def add_columns(self, table: str, cols: dict[str, str]) -> None:
+        have = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+        for c, typ in cols.items():
+            if c not in have:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {c} {typ}")
+        self._conn.commit()
 
     @property
     def conn(self) -> sqlite3.Connection:
