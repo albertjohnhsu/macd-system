@@ -1,0 +1,350 @@
+"""命令列介面：`python -m twtrend <command>` 或安裝後 `twtrend <command>`。"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from .config import Config
+from .db import Database
+
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 30)
+
+
+def _ctx(args) -> tuple[Config, Database]:
+    cfg = Config.load(args.config)
+    if args.db:
+        cfg.db_path = args.db
+    cfg.finmind_token = cfg.finmind_token or os.getenv("FINMIND_TOKEN")
+    return cfg, Database(cfg.db_path)
+
+
+# ---------------------------------------------------------------- 資料
+def cmd_demo(args):
+    from .data import synthetic
+    cfg, db = _ctx(args)
+    data = synthetic.generate(n_stocks=args.stocks, start=args.start, end=args.end, seed=args.seed)
+    synthetic.write_to_db(db, data)
+    print(f"已寫入合成資料到 {cfg.db_path}：{args.stocks} 檔、{args.start} ~ {args.end}")
+    print(data["_kinds"]["kind"].value_counts().rename("股票類型").to_string())
+
+
+def cmd_update(args):
+    from .data.finmind import FinMindClient
+    from .data.loader import update_from_finmind
+    cfg, db = _ctx(args)
+    client = FinMindClient(cfg.finmind_token)
+    stocks = args.stocks.split(",") if args.stocks else None
+    rep = update_from_finmind(db, client, args.start, args.end, stocks, cfg.benchmark,
+                              with_fundamentals=not args.prices_only)
+    print(f"更新 {rep.get('stocks', 0)} 檔，錯誤 {len(rep['errors'])} 筆")
+    for e in rep["errors"][:20]:
+        print("  ", e)
+
+
+def cmd_flags(args):
+    from .data.loader import update_flags
+    cfg, db = _ctx(args)
+    errors = update_flags(db, args.date)
+    print("安全旗標已更新" + (f"；{len(errors)} 個來源失敗：" if errors else ""))
+    for e in errors:
+        print("  ", e)
+
+
+# ---------------------------------------------------------------- 實盤
+def cmd_daily(args):
+    from . import live, notify
+    cfg, db = _ctx(args)
+    out = live.run_daily(db, cfg, args.date)
+    reg = out["regime"]
+    from .l1_regime import STATE_ZH
+    print(f"[{out['date'].date()}] 大盤：{STATE_ZH[reg['state']]}　分數 {reg['score']:.0f}　"
+          f"上限 {reg['cap']:.0%}　目標曝險 {reg['target_exposure']:.0%}")
+    print(f"權益 {out['equity']:,.0f}　現金 {out['cash']:,.0f}　持股 {len(out['positions'])} 檔")
+    if out["sells"]:
+        print("隔日賣出清單：")
+        for o in out["sells"]:
+            print(f"  {o.stock_id}  {o.shares:>7,} 股  {o.reason}")
+    else:
+        print("隔日賣出清單：無")
+    notify.flush_alerts(db, dry_run=args.dry_run)
+
+
+def cmd_weekly(args):
+    from . import live, notify
+    cfg, db = _ctx(args)
+    out = live.run_weekly(db, cfg, args.date)
+    tr = out["trend"]
+    print(f"[{out['date'].date()}] 趨勢分排名（L3 通過者）前 15：")
+    cols = ["trend_score", "rank", "high_52w_ratio", "tsmom_12m", "rel_strength", "revenue_yoy"]
+    print(tr[tr["trend_score"].notna()][cols].head(15).round(3).to_string())
+    if out["buys"]:
+        print("下週一買入清單（限價、未成交不追價）：")
+        for o in out["buys"]:
+            m = o.meta
+            print(f"  {o.stock_id}  {o.shares:>7,} 股  限價 {o.limit_price:>8.2f}  初始停損 {m['stop']:.2f}  "
+                  f"極端停損 {o.signal_price * (1 - cfg.l4.catastrophic_stop):.2f}  安全分 {m['safety_score']:.0f}"
+                  f"{'（部位減半）' if m['size_mult'] < 1 else ''}")
+    else:
+        print("買入清單：無（L1 不允許新增、或無合格候選 / 可用資金）")
+    notify.flush_alerts(db, dry_run=args.dry_run)
+
+
+def cmd_orders(args):
+    cfg, db = _ctx(args)
+    df = db.query("SELECT id, exec_date, stock_id, side, shares, limit_price, signal_price, status, reason "
+                  "FROM orders WHERE status = ? ORDER BY id", (args.status,))
+    df["reason"] = df["reason"].map(lambda s: json.loads(s).get("reason", s) if s and s.startswith("{") else s)
+    print(df.to_string(index=False) if not df.empty else "（無）")
+
+
+def cmd_fill(args):
+    from . import live
+    cfg, db = _ctx(args)
+    res = live.record_fill(db, cfg, args.order_id, args.date or pd.Timestamp.today().strftime("%Y-%m-%d"),
+                           args.price, args.shares, followed=not args.deviation, deviation=args.deviation)
+    if "position" in res:
+        p = res["position"]
+        print(f"已建立持股 {p.stock_id} {p.shares} 股 @ {p.entry_price}；初始停損 {p.initial_stop:.2f}；"
+              f"1R = {p.one_r:,.0f} 元；請設定極端保護停損條件單 {res['catastrophic_stop']:.2f}")
+    else:
+        print(f"已平倉，R 倍數 {res['r_multiple']:+.2f}" if res["r_multiple"] is not None else "已平倉")
+
+
+def cmd_cancel(args):
+    from . import live
+    cfg, db = _ctx(args)
+    live.cancel_order(db, args.order_id, args.reason)
+    print(f"委託 #{args.order_id} 已取消")
+
+
+def cmd_journal(args):
+    from . import live
+    cfg, db = _ctx(args)
+    df = live.journal(db)
+    print(df.to_string(index=False) if not df.empty else "（無交易紀錄）")
+    if args.csv:
+        df.to_csv(args.csv, index=False, encoding="utf-8-sig")
+        print(f"已輸出 {args.csv}")
+
+
+def cmd_monitor(args):
+    from . import live
+    from .monitor import STAGES, evaluate_lights, lights_frame, next_stage, overall
+    cfg, db = _ctx(args)
+    jr = live.journal(db)
+    eq = live.equity_curve_from_journal(db, cfg)
+    lights = evaluate_lights(jr, eq, cfg.monitor)
+    print(lights_frame(lights)[["level", "metric", "value", "yellow", "red", "note"]].round(3).to_string(index=False))
+    print(f"\n整體：{overall(lights)}")
+    n = int(jr["r_multiple"].notna().sum()) if not jr.empty else 0
+    stage, msg = next_stage(args.stage, lights, n)
+    print(f"資金階段建議：{STAGES[stage]['name']}（每筆風險 {STAGES[stage]['risk']:.2%}）— {msg}")
+
+
+def cmd_dashboard(args):
+    from . import dashboard, live
+    from .data.loader import load_market_data
+    from .engine import SignalEngine
+    from .monitor import evaluate_lights
+    cfg, db = _ctx(args)
+    md = load_market_data(db)
+    date = pd.Timestamp(args.date) if args.date else md.dates[-1]
+    eng = SignalEngine(md.slice(date), cfg)
+    saf = eng.safety(date, full=True)
+    tr = eng.trend(date)
+    positions = live.load_positions(db)
+    jr = live.journal(db)
+    eq = live.equity_curve_from_journal(db, cfg)
+    orders = db.query("SELECT exec_date AS 執行日, stock_id AS 代碼, side AS 買賣, shares AS 股數, "
+                      "limit_price AS 限價 FROM orders WHERE status='pending' ORDER BY id")
+    closed = jr[jr["r_multiple"].notna()].rename(columns={"exit_date": "exit_date"}) if not jr.empty else None
+    page = dashboard.render(
+        eng.regime, dashboard.candidates_frame(tr, saf), dashboard.holdings_frame(positions, md, saf, date),
+        orders, closed, eq if len(eq) > 1 else None, evaluate_lights(jr, eq, cfg.monitor),
+        {"p95": cfg.monitor.mdd_yellow, "p99": cfg.monitor.mdd_red}, title="台股趨勢追蹤 · 實盤監控")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(page, encoding="utf-8")
+    print(f"儀表板已輸出：{out}")
+
+
+# ---------------------------------------------------------------- 回測與統計
+def cmd_backtest(args):
+    from . import dashboard, stats
+    from .backtest import BEAR_PERIODS, Backtester, compare_benchmarks, period_report, split_2015
+    from .data.loader import load_benchmark, load_market_data
+    from .monitor import evaluate_lights
+    cfg, db = _ctx(args)
+    md = load_market_data(db)
+    bench = load_benchmark(db, cfg.benchmark)
+    res = Backtester(md, cfg).run(args.start, args.end)
+    cmp_ = compare_benchmarks(md, cfg, res, bench)
+    print("== 三個基準比較（以 Calmar 為主）==")
+    print(cmp_.round(3).to_string())
+    pr = period_report(res.equity, bench, BEAR_PERIODS)
+    if not pr.empty:
+        print("\n== 歷次空頭測試期 ==")
+        print(pr.round(3).to_string())
+    sp = split_2015(res.equity)
+    if len(sp) > 1:
+        print("\n== 2015/6 漲跌幅制度前後 ==")
+        print(sp.round(3).to_string())
+    closed = res.trades[~res.trades["open_at_end"]] if not res.trades.empty else res.trades
+    if not closed.empty:
+        st = stats.trade_stats(closed["r_multiple"])
+        mean, lo, hi = stats.bootstrap_expectancy_ci(closed["r_multiple"], closed["exit_date"])
+        print("\n== 交易統計（R）==")
+        for k, v in st.to_dict().items():
+            print(f"  {k:>18}: {v:.3f}" if isinstance(v, float) else f"  {k:>18}: {v}")
+        print(f"  期望值 95% CI（區塊 bootstrap）：{lo:+.3f} ~ {hi:+.3f} → {'有優勢' if lo > 0 else '尚無法證明優勢'}")
+        print(f"  95% 顯著所需筆數：{stats.required_trades(st.expectancy, st.std)}；t≥3 所需：{stats.required_trades(st.expectancy, st.std, 3)}")
+        print(f"  期望值打對折後：{st.expectancy / 2:+.3f}R（{'仍為正' if st.expectancy > 0 else '為負'}）")
+        mc = stats.mc_reorder(closed["r_multiple"], cfg.l4.risk_per_trade)
+        print(f"  交易順序重排 MC：MDD 中位數 {-mc['mdd'].median():.1%}、95% {-mc['mdd'].quantile(0.05):.1%}；"
+              f"最長連虧 95% {mc['max_streak'].quantile(0.95):.0f} 筆")
+        print("\n== 出場原因 ==")
+        print(closed["exit_reason"].str.split("：|（").str[0].value_counts().to_string())
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        res.trades.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame({"equity": res.equity, "exposure": res.exposure}).to_csv(out / "equity.csv", encoding="utf-8-sig")
+        cmp_.to_csv(out / "benchmarks.csv", encoding="utf-8-sig")
+        bh = bench.reindex(res.equity.index).ffill()
+        bh = bh / bh.iloc[0] * res.equity.iloc[0]
+        mc_b = None
+        if not closed.empty:
+            mc = stats.mc_reorder(closed["r_multiple"], cfg.l4.risk_per_trade)
+            mc_b = {"p95": float(-mc["mdd"].quantile(0.05)), "p99": float(-mc["mdd"].quantile(0.01))}
+        page = dashboard.render(res.regime, trades=closed, equity=res.equity,
+                                lights=evaluate_lights(closed, res.equity, cfg.monitor), mc_bands=mc_b,
+                                title="台股趨勢追蹤 · 回測報告",
+                                note=f"{res.equity.index[0].date()} ~ {res.equity.index[-1].date()}")
+        page = page.replace("<footer", "<section><h2>完整系統 vs 0050</h2>" + dashboard.line_chart(
+            {"完整系統": res.equity, "0050 買進持有": bh}, fmt="{:,.0f}") +
+            "<h3>三個基準</h3>" + dashboard.table(cmp_.reset_index().rename(columns={"index": "策略"}),
+                                                {c: "pct" for c in ("CAGR", "MDD", "Vol", "多頭參與率", "空頭平均持股")}) +
+            "</section><footer")
+        (out / "report.html").write_text(page, encoding="utf-8")
+        print(f"\n已輸出 {out}/trades.csv、equity.csv、benchmarks.csv、report.html")
+
+
+def cmd_simulate(args):
+    from . import stats
+    mat = stats.simulate_paths(n_paths=args.paths, n_trades=args.trades, win_rate=args.win_rate, seed=args.seed)
+    flat = mat.ravel()
+    st = stats.trade_stats(flat[: min(len(flat), 400_000)])
+    print("== 損益兩平勝率 ==")
+    print(stats.breakeven_table(cost_r=0.1).round(3).to_string(index=False))
+    print(f"\n== 模型期望值 ==\n  勝率 {st.win_rate:.1%}、盈虧比 {st.payoff:.2f}、期望值 {st.expectancy:+.2f}R、標準差 {st.std:.2f}R")
+    print(f"  前 5% 交易占淨利 {st.top5_share:.0%}；去掉前 2% 後期望值 {st.exp_without_top2:+.2f}R")
+    sd = stats.streak_distribution(mat)
+    print(f"\n== 連虧（{args.trades} 筆）==\n  中位數 {sd['median']:.0f}、95% {sd['p95']:.0f}；"
+          f"≥10 筆機率 {sd['prob_ge10']:.0%}、≥15 筆 {sd['prob_ge15']:.0%}")
+    print("\n== 每筆風險 vs 回撤 ==")
+    print(stats.risk_table(mat).round(3).to_string(index=False))
+    print(f"\nKelly 最適比例約 {stats.kelly_fraction(flat[:200_000]):.1%}（實務用 1/10–1/15 Kelly）")
+    print(f"95% 顯著所需筆數 {stats.required_trades(st.expectancy, st.std)}；t≥3 需 {stats.required_trades(st.expectancy, st.std, 3)}")
+
+
+def cmd_config(args):
+    cfg = Config()
+    print(yaml.safe_dump(json.loads(json.dumps(cfg.to_dict(), default=list)), allow_unicode=True, sort_keys=False))
+
+
+# ---------------------------------------------------------------- 入口
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="twtrend", description="台股趨勢追蹤系統")
+    p.add_argument("--config", default="config/default.yaml")
+    p.add_argument("--db", default=None, help="SQLite 路徑（覆寫設定檔）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("demo", help="產生合成資料（無法連線資料源時展示用）")
+    s.add_argument("--stocks", type=int, default=60)
+    s.add_argument("--start", default="2014-01-01")
+    s.add_argument("--end", default="2024-12-31")
+    s.add_argument("--seed", type=int, default=7)
+    s.set_defaults(func=cmd_demo)
+
+    s = sub.add_parser("update", help="從 FinMind 更新資料（需 FINMIND_TOKEN）")
+    s.add_argument("--start", required=True)
+    s.add_argument("--end")
+    s.add_argument("--stocks", help="逗號分隔；省略則抓全部")
+    s.add_argument("--prices-only", action="store_true")
+    s.set_defaults(func=cmd_update)
+
+    s = sub.add_parser("flags", help="從證交所/櫃買 OpenAPI 更新處置、注意、全額交割旗標")
+    s.add_argument("--date")
+    s.set_defaults(func=cmd_flags)
+
+    for name, fn, h in (("daily", cmd_daily, "每日收盤後：L1、安全旗標、追蹤停利、賣出清單"),
+                        ("weekly", cmd_weekly, "每週五收盤後：L2 排名與買入清單")):
+        s = sub.add_parser(name, help=h)
+        s.add_argument("--date")
+        s.add_argument("--dry-run", action="store_true", help="只印出提醒，不推播")
+        s.set_defaults(func=fn)
+
+    s = sub.add_parser("orders", help="列出委託")
+    s.add_argument("--status", default="pending")
+    s.set_defaults(func=cmd_orders)
+
+    s = sub.add_parser("fill", help="登錄成交")
+    s.add_argument("order_id", type=int)
+    s.add_argument("price", type=float)
+    s.add_argument("--date")
+    s.add_argument("--shares", type=int)
+    s.add_argument("--deviation", help="若未依訊號執行，寫下原因")
+    s.set_defaults(func=cmd_fill)
+
+    s = sub.add_parser("cancel", help="取消委託（如開盤超過限價未成交）")
+    s.add_argument("order_id", type=int)
+    s.add_argument("--reason", default="未成交，不追價")
+    s.set_defaults(func=cmd_cancel)
+
+    s = sub.add_parser("journal", help="交易日誌")
+    s.add_argument("--csv")
+    s.set_defaults(func=cmd_journal)
+
+    s = sub.add_parser("monitor", help="紅黃燈與資金階段建議")
+    s.add_argument("--stage", type=int, default=1, choices=[0, 1, 2])
+    s.set_defaults(func=cmd_monitor)
+
+    s = sub.add_parser("dashboard", help="輸出實盤監控儀表板 HTML")
+    s.add_argument("--date")
+    s.add_argument("--out", default="output/dashboard.html")
+    s.set_defaults(func=cmd_dashboard)
+
+    s = sub.add_parser("backtest", help="事件驅動回測與三基準比較")
+    s.add_argument("--start")
+    s.add_argument("--end")
+    s.add_argument("--out", default="output/backtest")
+    s.set_defaults(func=cmd_backtest)
+
+    s = sub.add_parser("simulate", help="重現設計書的統計模擬（多次小虧、靠大趨勢回補）")
+    s.add_argument("--paths", type=int, default=10_000)
+    s.add_argument("--trades", type=int, default=200)
+    s.add_argument("--win-rate", type=float, default=0.35)
+    s.add_argument("--seed", type=int, default=42)
+    s.set_defaults(func=cmd_simulate)
+
+    s = sub.add_parser("config", help="印出預設參數（可存成 YAML 後修改）")
+    s.set_defaults(func=cmd_config)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

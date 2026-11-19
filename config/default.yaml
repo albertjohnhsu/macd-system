@@ -1,0 +1,119 @@
+db_path: data/twtrend.sqlite
+benchmark: '0050'
+index_id: TAIEX
+finmind_token: null
+l1:
+  index_source: taiex
+  long_ma: 200
+  mid_ma: 60
+  slope_lookback: 20
+  tsmom_lookback: 252
+  breadth_ma: 60
+  breadth_threshold: 0.5
+  weights:
+    above_long_ma: 3.0
+    mid_ma_slope: 2.0
+    tsmom_12m: 3.0
+    breadth_above_ma: 2.0
+    new_high_minus_low: 1.0
+    futures_net_short_not_rising: 2.0
+    margin_not_overheated: 2.0
+    leading_indicator_up: 1.0
+    m1b_above_m2: 1.0
+  enter_bull: 65.0
+  exit_bull: 45.0
+  bear_threshold: 45.0
+  confirm_days: 3
+  cap_bull: 1.0
+  cap_warning: 0.5
+  cap_bear: 0.0
+  cap_recovery: 0.4
+  recovery_breadth_from: 0.2
+  recovery_breadth_to: 0.6
+  recovery_window: 10
+  recovery_enter: 55.0
+  recovery_exit: 30.0
+  max_step_per_rebalance: 0.34
+  use_multi_horizon: false
+  multi_horizons:
+  - 63
+  - 126
+  - 252
+l2:
+  gate_ma: 100
+  use_full_ma_stack: false
+  tsmom_lookback: 252
+  extreme_return_pct: 0.03
+  high_52w_min: 0.85
+  rel_strength_lookback: 63
+  weights:
+    high_52w_ratio: 0.4
+    revenue_yoy: 0.3
+    rel_strength: 0.2
+    tsmom_12m: 0.1
+  buy_top_pct: 0.3
+  hold_top_pct: 0.5
+l3:
+  min_turnover_60d: 30000000
+  min_market_cap: 5000000000
+  min_listed_days: 365
+  attention_lookback_days: 30
+  attention_max_count: 2
+  excluded_markets:
+  - emerging
+  - innovation
+  full_size_min: 70.0
+  half_size_min: 50.0
+  fscore_low: 3
+  zscore_low: 1.8
+  current_ratio_low: 1.0
+  interest_cover_low: 3.0
+  non_operating_ratio_high: 0.5
+  pledge_ratio_high: 0.3
+  margin_usage_high: 0.4
+  top_decile: 0.9
+  exempt_industries:
+  - 金融保險業
+  - 建材營造業
+l4:
+  total_capital: 3000000
+  risk_per_trade: 0.005
+  max_position_value: 300000
+  max_industry_weight: 0.3
+  min_positions: 6
+  max_positions: 12
+  max_adv_fraction: 0.05
+  atr_period: 20
+  initial_stop_atr_mult: 2.5
+  swing_low_lookback: 20
+  trailing_atr_period: 22
+  trailing_atr_mult: 3.0
+  catastrophic_stop: 0.15
+  pending_exit_days: 20
+  use_ma60_exit: false
+  rotate_on_rank: false
+  rebalance_weekday: 4
+  corr_lookback: 60
+  corr_cluster_threshold: 0.7
+  max_cluster_risk_r: 1.5
+  portfolio_vol_target: 0.2
+  buy_slippage_allow: 0.01
+  lot_size: 1
+cost:
+  commission: 0.001425
+  commission_discount: 1.0
+  tax: 0.003
+  slippage: 0.001
+  limit_pct_after_2015: 0.1
+  limit_pct_before_2015: 0.07
+monitor:
+  rolling_window: 50
+  mdd_yellow: 0.237
+  mdd_red: 0.3
+  streak_yellow: 16
+  streak_red: 20
+  loss_ratio_yellow: 1.3
+  loss_ratio_red: 1.5
+  slippage_assumed: 0.001
+  min_trades_for_own_dist: 100
+
