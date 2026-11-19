@@ -24,6 +24,8 @@
 | 監控 | `twtrend/monitor.py` | 黃燈 / 紅燈判定與資金階段升降級 |
 | 實盤 | `twtrend/live.py` | 每日 / 每週作業、委託、成交回報、交易日誌、決策日誌、提醒 |
 | 推播 | `twtrend/notify.py` | Telegram、LINE Messaging API（LINE Notify 已停止服務） |
+| 模擬盤 | `twtrend/paper.py`、`broker.py` | 類似股市大富翁的虛擬帳戶：依訊號自動下單、真實行情撮合（與回測同一套撮合規則）、可手動下單、逐日績效、排行榜 |
+| 規則檢討 | `twtrend/review.py` | 分組績效（出場原因、安全分、趨勢分、L1 狀態、手動與否）、出場後走勢、候選股機會成本、A/B 規則比較、修正建議 |
 | 儀表板 | `twtrend/dashboard.py` | 單一 HTML：大盤燈號、候選清單、持股安全分與停損距離、統計、R 分布、CUSUM、回撤 vs MC 百分位、紅黃燈 |
 | 資料 | `twtrend/data/` | FinMind、證交所 / 櫃買 OpenAPI、SQLite、合成資料 |
 
@@ -76,7 +78,40 @@ cron 範例（台北時間）：
 ```cron
 30 17 * * 1-5  cd /path/to/repo && twtrend update --start $(date -d '-7 day' +\%F) --prices-only && twtrend flags && twtrend daily
 0  19 * * 5    cd /path/to/repo && twtrend weekly
+45 17 * * 1-5  cd /path/to/repo && twtrend paper run && twtrend paper report
 ```
+
+## 模擬盤（先驗證、再上實盤）
+
+類似 CMoney 股市大富翁：每個模擬帳戶有虛擬資金，依系統訊號自動下單，以隔日開盤價撮合，
+扣手續費、證交稅與滑價，逐日記錄權益、持股、每一筆交易與每週候選清單（買 / 不買及原因）。
+
+```bash
+twtrend paper create baseline                                  # 用目前規則開一個帳戶（從今天開始前進測試）
+twtrend paper create wide_trail --set l4.trailing_atr_mult=3.5 # 同時開一個「修改版規則」帳戶做 A/B
+twtrend paper run                                              # 每日資料更新後執行：撮合 + 產生訊號
+twtrend paper status baseline                                  # 持股、待撮合委託、權益
+twtrend paper order baseline buy 2330 100 --note "看好"         # 手動下單（標記為人為干預，績效分開統計）
+twtrend paper board                                            # 排行榜（Calmar、MDD、勝率、期望值、相對 0050）
+twtrend paper review baseline --phase forward                  # 規則檢討
+twtrend paper compare baseline wide_trail                      # A/B：期望值差的 95% 信賴區間
+twtrend paper report                                           # output/paper.html
+```
+
+- **forward vs replay**：帳戶建立日（今天）之後的交易日是 forward，才是真正的樣本外證據；
+  `--start` 設在過去的部分是 replay（歷史重播），只能用來熟悉流程，不能當成驗證。
+- **規則版本**：每個帳戶保存完整參數快照與雜湊，事後可追溯是哪一版規則產生的績效；`paper compare` 會列出兩帳戶的規則差異。
+- **與實盤的關係**：模擬盤就是操作手冊的「階段 0 流程試跑」。紅黃燈與 `twtrend monitor` 的標準同樣適用。
+
+### 用模擬盤修正規則的流程
+
+1. `paper review` 列出「候選修正 / 觀察 / 正常」。只有樣本數足夠、且分組差異的信賴區間不重疊才會列為候選修正
+2. 對每個候選修正開一個 A/B 帳戶（`--set 參數=值`），與基準帳戶並行前進測試
+3. 兩邊各至少 30 筆以上，`paper compare` 顯示「B 顯著較好」，且不是靠回撤變大換來的
+4. 用 `twtrend backtest` 檢查 2015 前後兩段都穩定、期望值打對折後仍為正
+5. 才把新參數寫進 `config/default.yaml`，並保留舊版帳戶繼續跑一段時間作對照
+
+不要因為連虧或一次股災就改規則（設計書「不要做的優化」）；黃燈只檢討、不改規則。
 
 ## 資金階段
 

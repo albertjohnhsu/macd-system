@@ -21,28 +21,7 @@ from .config import Config
 from .data.market import MarketData
 from .engine import SignalEngine
 from .l1_regime import compute_regime, regime_index, switches_per_year
-from .portfolio import Order, Position, trade_cost
-
-REGIME_CHANGE_2015 = pd.Timestamp("2015-06-01")
-
-
-def limit_pct(date: pd.Timestamp, cfg: Config) -> float:
-    return cfg.cost.limit_pct_before_2015 if date < REGIME_CHANGE_2015 else cfg.cost.limit_pct_after_2015
-
-
-def locked(md: MarketData, date: pd.Timestamp, sid: str, direction: str, cfg: Config) -> bool:
-    """整日鎖在漲停（up）或跌停（down）：最高 = 最低，且漲跌幅接近上限。"""
-    try:
-        h, l, c = md.high.at[date, sid], md.low.at[date, sid], md.close.at[date, sid]
-        prev = md.close.loc[:date, sid].iloc[-2]
-    except (KeyError, IndexError):
-        return False
-    if np.isnan(h) or np.isnan(prev) or abs(h - l) > 1e-9:
-        return False
-    chg = c / prev - 1
-    lp = limit_pct(date, cfg) - 0.005
-    return chg >= lp if direction == "up" else chg <= -lp
-
+from .broker import REGIME_CHANGE_2015, SimBroker, limit_pct, locked  # noqa: F401
 
 @dataclass
 class BacktestResult:
@@ -98,135 +77,32 @@ def l1_only(md: MarketData, cfg: Config, asset: pd.Series, regime: pd.DataFrame 
 
 
 class Backtester:
+    """事件驅動回測：逐日呼叫 SimBroker（與模擬盤共用撮合規則）。"""
+
     def __init__(self, md: MarketData, cfg: Config, engine: SignalEngine | None = None):
         self.md = md
         self.cfg = cfg
         self.engine = engine or SignalEngine(md, cfg)
 
     def run(self, start=None, end=None) -> BacktestResult:
-        md, cfg, eng = self.md, self.cfg, self.engine
-        dates = md.dates
-        dates = dates[(dates >= pd.Timestamp(start)) if start else slice(None)]
+        dates = self.md.dates
+        if start:
+            dates = dates[dates >= pd.Timestamp(start)]
         if end:
             dates = dates[dates <= pd.Timestamp(end)]
-        c = cfg.cost
-        cash = float(cfg.l4.total_capital)
-        positions: dict[str, Position] = {}
-        pending: list[Order] = []
-        trades: list[dict] = []
-        decisions: list[dict] = []
-        eq_hist, exp_hist = {}, {}
-
-        def mark(d):
-            v = 0.0
-            for s, p in positions.items():
-                px = md.close.loc[:d, s].dropna()
-                v += p.shares * (float(px.iloc[-1]) if len(px) else p.entry_price)
-            return v
-
+        broker = SimBroker(self.md, self.cfg, self.engine)
         for i, d in enumerate(dates):
-            # ---- 1. 開盤：執行前一日產生的委託
-            carry: list[Order] = []
-            for o in pending:
-                op = md.open.at[d, o.stock_id] if o.stock_id in md.open else np.nan
-                if np.isnan(op):
-                    if o.side == "sell":
-                        carry.append(o)
-                    continue
-                if o.side == "sell":
-                    if o.stock_id not in positions:
-                        continue
-                    if locked(md, d, o.stock_id, "down", cfg):
-                        carry.append(o)       # 跌停鎖死：隔日繼續掛
-                        continue
-                    fill = op * (1 - c.slippage)
-                    cash += self._close_position(positions.pop(o.stock_id), d, fill, o, trades)
-                else:
-                    if o.stock_id in positions or locked(md, d, o.stock_id, "up", cfg):
-                        continue
-                    if o.limit_price is not None and op > o.limit_price:
-                        decisions.append({"date": d, "stock_id": o.stock_id, "action": "skip_buy",
-                                          "reason": f"開盤 {op:.2f} > 限價 {o.limit_price:.2f}，不追價"})
-                        continue
-                    fill = op * (1 + c.slippage)
-                    value = o.shares * fill
-                    fee = trade_cost(value, "buy", c.commission, c.commission_discount, c.tax)
-                    if value + fee > cash:
-                        continue
-                    cash -= value + fee
-                    m = o.meta
-                    stop = min(m["stop"], fill * 0.999)
-                    positions[o.stock_id] = Position(
-                        o.stock_id, o.shares, d, fill, stop, o.shares * (fill - stop), fill, stop,
-                        fill * (1 - cfg.l4.catastrophic_stop), m.get("industry", ""), m.get("size_mult", 1.0),
-                        m.get("state", ""), m.get("trend_score", np.nan), m.get("safety_score", np.nan),
-                        o.signal_date, o.signal_price, None, fee)
-            pending = carry
-
-            # ---- 2. 盤中：極端保護停損條件單
-            for sid in list(positions):
-                p = positions[sid]
-                lo = md.low.at[d, sid] if sid in md.low else np.nan
-                if np.isnan(lo) or lo > p.catastrophic_stop:
-                    continue
-                if locked(md, d, sid, "down", cfg):
-                    continue
-                fill = min(float(md.open.at[d, sid]), p.catastrophic_stop) * (1 - c.slippage)
-                o = Order(sid, "sell", p.shares, d, p.catastrophic_stop, None, "極端保護停損（盤中條件單）", 2)
-                cash += self._close_position(positions.pop(sid), d, fill, o, trades)
-                pending = [x for x in pending if x.stock_id != sid]
-
-            # ---- 3. 收盤：更新停損、產生訊號
-            eng.update_stops(d, positions)
-            equity = cash + mark(d)
-            eq_hist[d] = equity
-            exp_hist[d] = (equity - cash) / equity if equity > 0 else 0.0
-            weekly = self._is_rebalance_day(dates, i)
-            sells = eng.sell_signals(d, positions, equity, weekly=weekly)
-            sell_ids = {o.stock_id for o in sells} | {o.stock_id for o in pending if o.side == "sell"}
-            pending.extend(o for o in sells if o.stock_id not in {x.stock_id for x in pending})
-            for o in sells:
-                decisions.append({"date": d, "stock_id": o.stock_id, "action": "sell", "reason": o.reason})
-            if weekly:
-                proceeds = sum(positions[s].shares * md.close.at[d, s] for s in sell_ids if s in positions)
-                buys = eng.buy_signals(d, positions, equity, cash + proceeds * 0.99, sell_ids)
-                pending.extend(buys)
-                for o in buys:
-                    decisions.append({"date": d, "stock_id": o.stock_id, "action": "buy", "reason": o.reason})
-
-        # 期末平倉（只為統計交易，不計入權益曲線）
-        last = dates[-1]
-        for sid, p in list(positions.items()):
-            px = float(md.close.loc[:last, sid].dropna().iloc[-1])
-            o = Order(sid, "sell", p.shares, last, px, None, "期末未平倉（以收盤估值）", 99)
-            self._close_position(p, last, px, o, trades, open_trade=True)
-
-        equity = pd.Series(eq_hist)
-        exposure = pd.Series(exp_hist)
-        return BacktestResult(equity, exposure, pd.DataFrame(trades), eng.regime.reindex(equity.index), decisions)
-
-    def _is_rebalance_day(self, dates: pd.DatetimeIndex, i: int) -> bool:
-        """每週最後一個交易日（預設週五）收盤後重算排名。"""
-        if i == len(dates) - 1:
-            return True
-        return dates[i + 1].isocalendar()[1] != dates[i].isocalendar()[1]
-
-    def _close_position(self, p: Position, d, fill: float, o: Order, trades: list, open_trade: bool = False) -> float:
-        c = self.cfg.cost
-        value = p.shares * fill
-        fee = trade_cost(value, "sell", c.commission, c.commission_discount, c.tax)
-        pnl = value - fee - p.shares * p.entry_price - p.entry_cost
-        trades.append({
-            "stock_id": p.stock_id, "signal_date": p.signal_date, "signal_price": p.signal_price,
-            "entry_date": p.entry_date, "entry_price": p.entry_price, "shares": p.shares,
-            "initial_stop": p.initial_stop, "one_r": p.one_r, "exit_date": d, "exit_price": fill,
-            "exit_signal_price": o.signal_price, "exit_reason": o.reason, "pnl": pnl,
-            "r_multiple": pnl / p.one_r if p.one_r > 0 else np.nan,
-            "entry_state": p.entry_state, "trend_score": p.entry_trend_score,
-            "safety_score": p.entry_safety_score, "industry": p.industry, "open_at_end": open_trade,
-            "holding_days": (pd.Timestamp(d) - pd.Timestamp(p.entry_date)).days,
-        })
-        return value - fee
+            broker.step(d, dates[i + 1] if i + 1 < len(dates) else None)
+        # 期末未平倉以收盤估值納入交易統計（不影響權益曲線）
+        trades = pd.DataFrame(broker.trades + broker.mark_open_trades(dates[-1]))
+        if not trades.empty:
+            trades["open_at_end"] = trades["open_at_end"].fillna(False).astype(bool)
+            trades.loc[trades["open_at_end"], "exit_reason"] = "期末未平倉（以收盤估值）"
+            trades.loc[trades["open_at_end"], "exit_date"] = dates[-1]
+        equity = pd.Series(broker.equity)
+        self.broker = broker
+        return BacktestResult(equity, pd.Series(broker.exposure), trades,
+                              self.engine.regime.reindex(equity.index), broker.decisions)
 
 
 def compare_benchmarks(md: MarketData, cfg: Config, result: BacktestResult,

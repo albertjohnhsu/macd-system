@@ -137,7 +137,9 @@ def table(df: pd.DataFrame, formats: dict[str, str] | None = None, max_rows: int
         for c in df.columns:
             v = r[c]
             kind = formats.get(c)
-            if isinstance(v, (int, float, np.floating, np.integer)) and kind != "raw":
+            if isinstance(v, (bool, np.bool_)):
+                cells.append(f"<td>{'是' if v else '否'}</td>")
+            elif isinstance(v, (int, float, np.floating, np.integer)) and kind != "raw":
                 cells.append(f'<td class="num">{_fmt(float(v), kind or "num")}</td>')
             else:
                 cells.append(f"<td>{v if kind == 'html' else _e('' if pd.isna(v) else v)}</td>")
@@ -298,3 +300,48 @@ def candidates_frame(trend: pd.DataFrame, safety: pd.DataFrame, n: int = 20) -> 
         "12月報酬": t["tsmom_12m"].values, "營收YoY": t["revenue_yoy"].values,
         "部位": safety["size_mult"].reindex(t.index).map({1.0: "完整", 0.5: "減半"}).values,
     })
+
+
+def render_paper(board: pd.DataFrame, curves: dict[str, pd.Series], findings: pd.DataFrame | None,
+                 attributions: dict[str, pd.DataFrame], exit_fu: pd.DataFrame | None,
+                 cand_fu: pd.DataFrame | None, ab: pd.DataFrame | None, title: str = "模擬盤績效與規則檢討",
+                 note: str = "") -> str:
+    """模擬盤報告：排行榜、資金曲線、規則檢討（分組績效、出場後走勢、候選機會成本、A/B 比較）。"""
+    pct = {c: "pct" for c in ("報酬", "年化", "MDD", "平均曝險", "勝率", "0050報酬", "超額", "0050 MDD", "R占比",
+                              "後20日平均", "後60日平均", "後60日勝率", "出場後20日平均", "出場後60日平均",
+                              "60日內再漲>20%比例", "A報酬", "B報酬", "A MDD", "B MDD")}
+    pct.update({"交易數": "int", "筆數": "int", "手動交易": "int", "可追蹤筆數": "int", "A筆數": "int", "B筆數": "int"})
+    sec = [f"<section><h2>排行榜（依 Calmar）</h2>{table(board, pct)}"
+           "<p class='muted'>forward = 帳戶建立後的真實前進測試；replay = 建立前的歷史重播（已見過的資料，不能當樣本外證據）。</p></section>"]
+    if curves:
+        norm = {k: v / v.dropna().iloc[0] for k, v in curves.items() if len(v.dropna()) > 1}
+        sec.append(f"<section><h2>資金曲線（起點 = 1）</h2>{line_chart(norm, fmt='{:.2f}')}</section>")
+    if findings is not None and not findings.empty:
+        color = {"候選修正": "var(--warn)", "觀察": "var(--info)", "正常": "var(--good)"}
+        rows = "".join(f"<tr><td><span class='dot' style='background:{color.get(r['判定'], 'var(--muted)')}'></span>"
+                       f"{_e(r['判定'])}</td><td>{_e(r.get('帳戶', ''))}</td><td>{_e(r['項目'])}</td>"
+                       f"<td style='white-space:normal'>{_e(r['證據'])}</td><td style='white-space:normal'>{_e(r['建議'])}</td></tr>"
+                       for _, r in findings.iterrows())
+        sec.append("<section><h2>規則檢討</h2><div class='tw'><table><thead><tr><th>判定</th><th>帳戶</th><th>項目</th>"
+                   f"<th>證據</th><th>建議</th></tr></thead><tbody>{rows}</tbody></table></div>"
+                   "<p class='muted'>候選修正不代表立即修改：先用 <code>twtrend paper create &lt;新帳戶&gt; --set 參數=值</code> "
+                   "開 A/B 帳戶前進測試，達到樣本數且差異顯著、並通過 2015 前後兩段回測後才換版。</p></section>")
+    if ab is not None and not ab.empty:
+        sec.append(f"<section><h2>A/B 規則比較（B − A 期望值差，95% CI）</h2>{table(ab, pct)}</section>")
+    for name, df in attributions.items():
+        if df is not None and not df.empty:
+            sec.append(f"<section><h2>分組績效：{_e(name)}</h2>{table(df, pct)}</section>")
+    if exit_fu is not None and not exit_fu.empty:
+        sec.append(f"<section><h2>出場後走勢</h2>{table(exit_fu, pct)}"
+                   "<p class='muted'>停利 / 停損後 60 日內再漲 &gt; 20% 的比例偏高，代表出場可能太緊。</p></section>")
+    if cand_fu is not None and not cand_fu.empty:
+        sec.append(f"<section><h2>候選股事後報酬：已買 vs 未買原因</h2>{table(cand_fu, pct)}"
+                   "<p class='muted'>用來估計 L1、安全分、分群與產業上限等限制的機會成本。</p></section>")
+    gen = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{_e(title)}</title>
+<style>{CSS}</style></head><body><main>
+<header><h1>{_e(title)}</h1><div class="muted">產生時間 {gen}{(' · ' + _e(note)) if note else ''}</div></header>
+{''.join(sec)}
+<footer class="muted">模擬盤以收盤後訊號、隔日開盤價撮合，含手續費、證交稅與滑價；不代表實際可成交價格。</footer>
+</main></body></html>"""

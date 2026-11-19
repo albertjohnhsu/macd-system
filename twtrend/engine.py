@@ -175,7 +175,8 @@ class SignalEngine:
 
     # ------------------------------------------------------------ 買入
     def buy_signals(self, date, positions: dict[str, Position], equity: float, cash: float,
-                    pending_sells: set[str] | None = None) -> list[Order]:
+                    pending_sells: set[str] | None = None, log: list | None = None) -> list[Order]:
+        """產生買入清單。傳入 log（list）時，會記錄每個候選「買 / 不買及原因」，供模擬盤做規則檢討。"""
         d = pd.Timestamp(date)
         c4 = self.cfg.l4
         pending_sells = pending_sells or set()
@@ -186,16 +187,36 @@ class SignalEngine:
         target = min(float(reg["target_exposure"]), self.vol_scaled_cap(d, held, equity))
         exposure = sum(p.shares * self._px(d, s) for s, p in held.items())
         available = min(equity * target - exposure, cash)
-        if available <= 0 or len(held) >= c4.max_positions:
-            return []
-        # 空頭 / 轉弱警戒：停止新增部位
-        if reg["state"] in ("BEAR", "WARNING"):
+        gate_reason = None
+        if reg["state"] in ("BEAR", "WARNING"):          # 空頭 / 轉弱警戒：停止新增部位
+            gate_reason = f"L1 {STATE_ZH.get(reg['state'])}：停止新增"
+        elif available <= 0:
+            gate_reason = "已達 L1 曝險上限或現金不足"
+        elif len(held) >= c4.max_positions:
+            gate_reason = "持股檔數已滿"
+        if gate_reason and log is None:
             return []
 
         saf = self.safety(d, full=True)
         tr = self.trend(d)
         cands = tr[tr["buy_zone"] & tr["trend_score"].notna()]
         cands = cands[~cands.index.isin(list(positions))]
+
+        def record(sid, row, decision, reason, shares=0):
+            if log is not None:
+                log.append({
+                    "date": d, "stock_id": sid, "rank": int(row["rank"]), "trend_score": float(row["trend_score"]),
+                    "safety_score": float(saf.at[sid, "score"]) if sid in saf.index else np.nan,
+                    "size_mult": float(saf.at[sid, "size_mult"]) if sid in saf.index else 0.0,
+                    "state": reg["state"], "price": self._px(d, sid), "decision": decision,
+                    "reason": reason, "shares": shares,
+                })
+
+        if gate_reason:
+            for sid, row in cands.iterrows():
+                record(sid, row, "skip", gate_reason)
+            return []
+
         info = self.md.info
         ind_value: dict[str, float] = {}
         for s, p in held.items():
@@ -207,14 +228,17 @@ class SignalEngine:
         n_pos = len(held)
         for sid, row in cands.iterrows():
             if n_pos >= c4.max_positions or available <= 0:
-                break
+                record(sid, row, "skip", "持股檔數已滿" if n_pos >= c4.max_positions else "可用資金用完")
+                continue
             mult = float(saf.at[sid, "size_mult"]) if sid in saf.index else 0.0
             if mult <= 0:
+                record(sid, row, "skip", "安全分不足")
                 continue
             hist_c = self.md.close.loc[:d, sid].dropna()
             hist_l = self.md.low.loc[:d, sid].dropna()
             a = self.atr_entry.at[d, sid]
             if len(hist_c) < c4.swing_low_lookback or np.isnan(a):
+                record(sid, row, "skip", "歷史資料不足")
                 continue
             px = float(hist_c.iloc[-1])
             stop = initial_stop_price(hist_c, hist_l, float(a), c4.initial_stop_atr_mult, c4.swing_low_lookback)
@@ -224,10 +248,12 @@ class SignalEngine:
                                      c4.max_position_value, mult, self.adv20.at[d, sid], c4.max_adv_fraction,
                                      min(available, ind_room), c4.lot_size)
             if shares <= 0:
+                record(sid, row, "skip", "產業上限" if ind_room <= 0 else "部位計算為 0")
                 continue
             # 相關分群上限：與既有持股 60 日相關 > 0.7 視為同群，每群風險合計 ≤ 1.5R
             cluster = self._cluster_of(d, sid, held)
             if cluster is not None and clusters_r.get(cluster, 0.0) + mult > c4.max_cluster_risk_r + 1e-9:
+                record(sid, row, "skip", "相關分群上限")
                 continue
             value = shares * px
             orders.append(Order(sid, "buy", shares, d, px, round(px * (1 + c4.buy_slippage_allow), 2),
@@ -236,6 +262,7 @@ class SignalEngine:
                                     "safety_score": float(saf.at[sid, "score"]), "size_mult": mult,
                                     "state": reg["state"], "industry": industry,
                                 }))
+            record(sid, row, "buy", orders[-1].reason, shares)
             available -= value
             ind_value[industry] = ind_value.get(industry, 0.0) + value
             key = cluster if cluster is not None else sid
@@ -243,6 +270,17 @@ class SignalEngine:
             held = {**held, sid: Position(sid, shares, d, px, stop, 0, px, stop, 0, industry, mult)}
             n_pos += 1
         return orders
+
+    def manual_stop(self, date, sid: str) -> float:
+        """手動下單時套用同一套初始停損公式。"""
+        d = pd.Timestamp(date)
+        c4 = self.cfg.l4
+        hist_c = self.md.close.loc[:d, sid].dropna()
+        hist_l = self.md.low.loc[:d, sid].dropna()
+        a = self.atr_entry.at[d, sid]
+        if len(hist_c) < c4.swing_low_lookback or np.isnan(a):
+            return float(hist_c.iloc[-1]) * 0.92
+        return initial_stop_price(hist_c, hist_l, float(a), c4.initial_stop_atr_mult, c4.swing_low_lookback)
 
     def _corr(self, d: pd.Timestamp, cols: list[str]) -> pd.DataFrame:
         r = self.ret.loc[:d, cols].tail(self.cfg.l4.corr_lookback)

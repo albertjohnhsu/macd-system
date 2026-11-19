@@ -260,6 +260,218 @@ def cmd_config(args):
     print(yaml.safe_dump(json.loads(json.dumps(cfg.to_dict(), default=list)), allow_unicode=True, sort_keys=False))
 
 
+# ---------------------------------------------------------------- 模擬盤
+def _paper_md(db):
+    from .data.loader import load_market_data
+    return load_market_data(db)
+
+
+def cmd_paper_create(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    info = paper.create_account(db, args.name, cfg, args.capital, args.start, args.set, args.note, args.manual)
+    print(f"已建立模擬帳戶 {info['name']}（規則版本 {info['rule_version']}），起始日 {info['start_date']}")
+    if info["overrides"]:
+        print("  參數覆寫：" + "、".join(f"{k}={v}" for k, v in info["overrides"].items()))
+    print("  執行 `twtrend paper run` 開始撮合（起始日早於今天的部分會標記為 replay 歷史重播）")
+
+
+def cmd_paper_list(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    df = paper.list_accounts(db)
+    print(df.to_string(index=False) if not df.empty else "（尚無模擬帳戶，請用 `twtrend paper create`）")
+
+
+def cmd_paper_run(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    md = _paper_md(db)
+    if args.name:
+        res = [paper.run_account(db, md, args.name, args.until)]
+    else:
+        res = paper.run_all(db, md, args.until)
+    for r in res:
+        if not r.get("days"):
+            print(f"{r['name']}：已是最新")
+            continue
+        print(f"{r['name']}：推進 {r['days']} 日 → 權益 {r['equity']:,.0f}、現金 {r['cash']:,.0f}、"
+              f"持股 {r['positions']} 檔、待撮合 {r['pending']} 筆、本次結算 {r['trades']} 筆")
+
+
+def cmd_paper_order(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    out = paper.place_order(db, _paper_md(db), args.name, args.side, args.stock, args.shares, args.limit, args.note)
+    o = out["order"]
+    print(f"{args.name}：手動{'買進' if o.side == 'buy' else '賣出'} {o.stock_id} {o.shares} 股"
+          f"{f'（限價 {o.limit_price}）' if o.limit_price else ''}，{out['exec']}；此筆會標記為人為干預")
+
+
+def cmd_paper_status(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    st = paper.status(db, _paper_md(db), args.name)
+    acc = st["account"]
+    eq = st["equity"]
+    print(f"帳戶 {acc['name']}（規則 {acc['rule_version']}）　最後撮合日 {st['last_date'].date() if st['last_date'] is not None else '—'}")
+    if not eq.empty:
+        e = eq["equity"]
+        print(f"權益 {e.iloc[-1]:,.0f}（{e.iloc[-1] / acc['capital'] - 1:+.2%}）　現金 {st['cash']:,.0f}　"
+              f"最大回撤 {(e / e.cummax() - 1).min():.2%}")
+    if not st["holdings"].empty:
+        h = st["holdings"][["stock_id", "shares", "entry_date", "entry_price", "close", "stop", "r_multiple", "manual_entry"]]
+        print("持股：")
+        print(h.round({"entry_price": 2, "close": 2, "stop": 2, "r_multiple": 2}).to_string(index=False))
+    if not st["pending"].empty:
+        print("待撮合委託：")
+        print(st["pending"].to_string(index=False))
+
+
+def cmd_paper_board(args):
+    from . import paper
+    from .data.loader import load_benchmark
+    cfg, db = _ctx(args)
+    b = paper.leaderboard(db, load_benchmark(db, cfg.benchmark), args.phase)
+    print(b.round(3).to_string(index=False) if not b.empty else "（尚無績效）")
+
+
+def cmd_paper_review(args):
+    from . import paper, review
+    cfg, db = _ctx(args)
+    md = _paper_md(db)
+    t = paper.trades(db, args.name, args.phase)
+    sig = paper.signals(db, args.name)
+    print(f"== 規則檢討：{args.name}（{args.phase or '全部'}，{len(t)} 筆已結算）==")
+    print(review.findings_frame(review.findings(t, md, sig)).to_string(index=False))
+    if not t.empty:
+        for by in ("出場原因", "安全分組", "趨勢分組", "進場狀態"):
+            df = review.attribution(t, by)
+            if not df.empty:
+                print(f"\n-- 分組：{by} --")
+                print(df.round(3).to_string(index=False))
+        print("\n-- 出場後走勢 --")
+        print(review.exit_followup(t, md).round(3).to_string(index=False))
+    if not sig.empty:
+        print("\n-- 候選股事後報酬 --")
+        print(review.candidate_followup(sig, md).round(3).to_string(index=False))
+
+
+def cmd_paper_compare(args):
+    from . import review
+    cfg, db = _ctx(args)
+    df = review.compare_accounts(db, args.base, args.others, args.phase)
+    print(df.round(3).to_string(index=False))
+
+
+def cmd_paper_report(args):
+    from . import dashboard, paper, review
+    from .data.loader import load_benchmark
+    cfg, db = _ctx(args)
+    md = _paper_md(db)
+    bench = load_benchmark(db, cfg.benchmark)
+    board = paper.leaderboard(db, bench, args.phase)
+    accounts = paper.list_accounts(db)["name"].tolist()
+    curves = {n: paper.equity(db, n)["equity"] for n in accounts}
+    if curves:
+        idx = max(curves.values(), key=len).index
+        if len(idx):
+            curves["0050 買進持有"] = bench.reindex(idx).ffill()
+    focus = args.name or (board.iloc[0]["帳戶"] if not board.empty else None)
+    fs, attr, efu, cfu, ab = pd.DataFrame(), {}, None, None, None
+    if focus:
+        t = paper.trades(db, focus, args.phase)
+        sig = paper.signals(db, focus)
+        fs = review.findings_frame(review.findings(t, md, sig))
+        fs.insert(1, "帳戶", focus)
+        if not t.empty:
+            attr = {f"{focus} · {by}": review.attribution(t, by) for by in ("出場原因", "安全分組", "趨勢分組", "進場狀態", "手動")}
+            efu = review.exit_followup(t, md)
+        cfu = review.candidate_followup(sig, md) if not sig.empty else None
+        others = [n for n in accounts if n != focus]
+        if others:
+            ab = review.compare_accounts(db, focus, others, args.phase)
+    page = dashboard.render_paper(board, curves, fs, attr, efu, cfu, ab,
+                                  note=f"檢討帳戶：{focus}" if focus else "")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(page, encoding="utf-8")
+    print(f"模擬盤報告已輸出：{out}")
+
+
+def cmd_paper_toggle(args):
+    from . import paper
+    cfg, db = _ctx(args)
+    if args.action == "delete":
+        paper.delete_account(db, args.name)
+        print(f"已刪除模擬帳戶 {args.name} 與其紀錄")
+    else:
+        paper.set_active(db, args.name, args.action == "resume")
+        print(f"{args.name} 已{'恢復' if args.action == 'resume' else '暫停'}")
+
+
+def add_paper_parser(sub):
+    pp = sub.add_parser("paper", help="模擬盤（類似股市大富翁）：虛擬帳戶、自動撮合、績效與規則檢討")
+    ps = pp.add_subparsers(dest="paper_cmd", required=True)
+
+    s = ps.add_parser("create", help="建立模擬帳戶（可用 --set 覆寫參數做 A/B 規則比較）")
+    s.add_argument("name")
+    s.add_argument("--capital", type=float)
+    s.add_argument("--start", help="起始日；早於今天的部分視為 replay 歷史重播")
+    s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="參數覆寫，例如 --set l4.trailing_atr_mult=3.5，可重複")
+    s.add_argument("--note", default="")
+    s.add_argument("--manual", action="store_true", help="純手動帳戶：不產生系統訊號，只撮合你的委託")
+    s.set_defaults(func=cmd_paper_create)
+
+    s = ps.add_parser("list", help="列出模擬帳戶")
+    s.set_defaults(func=cmd_paper_list)
+
+    s = ps.add_parser("run", help="撮合到最新資料日（每日收盤資料更新後執行）")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--until")
+    s.set_defaults(func=cmd_paper_run)
+
+    s = ps.add_parser("order", help="手動下單（下一個交易日開盤撮合，標記為人為干預）")
+    s.add_argument("name")
+    s.add_argument("side", choices=["buy", "sell"])
+    s.add_argument("stock")
+    s.add_argument("shares", type=int, nargs="?")
+    s.add_argument("--limit", type=float)
+    s.add_argument("--note", default="")
+    s.set_defaults(func=cmd_paper_order)
+
+    s = ps.add_parser("status", help="帳戶持股、委託與權益")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_paper_status)
+
+    s = ps.add_parser("board", help="排行榜")
+    s.add_argument("--phase", choices=["forward", "replay"])
+    s.set_defaults(func=cmd_paper_board)
+
+    s = ps.add_parser("review", help="規則檢討：分組績效、出場後走勢、候選機會成本、修正建議")
+    s.add_argument("name")
+    s.add_argument("--phase", choices=["forward", "replay"])
+    s.set_defaults(func=cmd_paper_review)
+
+    s = ps.add_parser("compare", help="A/B 規則比較（B − A 期望值差與 CI）")
+    s.add_argument("base")
+    s.add_argument("others", nargs="+")
+    s.add_argument("--phase", choices=["forward", "replay"])
+    s.set_defaults(func=cmd_paper_compare)
+
+    s = ps.add_parser("report", help="輸出模擬盤 HTML 報告")
+    s.add_argument("--name", help="規則檢討的主帳戶（預設排行第一）")
+    s.add_argument("--phase", choices=["forward", "replay"])
+    s.add_argument("--out", default="output/paper.html")
+    s.set_defaults(func=cmd_paper_report)
+
+    for act in ("pause", "resume", "delete"):
+        s = ps.add_parser(act, help={"pause": "暫停帳戶", "resume": "恢復帳戶", "delete": "刪除帳戶與紀錄"}[act])
+        s.add_argument("name")
+        s.set_defaults(func=cmd_paper_toggle, action=act)
+
+
 # ---------------------------------------------------------------- 入口
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="twtrend", description="台股趨勢追蹤系統")
@@ -334,6 +546,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--win-rate", type=float, default=0.35)
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_simulate)
+
+    add_paper_parser(sub)
 
     s = sub.add_parser("config", help="印出預設參數（可存成 YAML 後修改）")
     s.set_defaults(func=cmd_config)
